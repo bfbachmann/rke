@@ -11,7 +11,12 @@ import (
 	"strings"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/transport"
+	"k8s.io/client-go/util/retry"
 
 	"github.com/rancher/rke/hosts"
 	"github.com/rancher/rke/k8s"
@@ -82,35 +87,137 @@ func (c *Cluster) GetStateFileFromConfigMap(ctx context.Context) (string, error)
 	return "", fmt.Errorf("Unable to get ConfigMap with cluster state from any Control Plane host")
 }
 
-func SaveFullStateToKubernetes(ctx context.Context, kubeCluster *Cluster, fullState *FullState) error {
+// SaveFullStateToK8s saves the full cluster state to a k8s secret. This any errors that occur on attempts to update
+// the secret will be retired up until some limit.
+func SaveFullStateToK8s(ctx context.Context, kubeCluster *Cluster, fullState *FullState) error {
 	k8sClient, err := k8s.NewClient(kubeCluster.LocalKubeConfigPath, kubeCluster.K8sWrapTransport)
 	if err != nil {
-		return fmt.Errorf("Failed to create Kubernetes Client: %v", err)
+		return fmt.Errorf("failed to create Kubernetes Client: %w", err)
 	}
+
 	log.Infof(ctx, "[state] Saving full cluster state to Kubernetes")
-	stateFile, err := json.Marshal(*fullState)
+	stateBytes, err := json.Marshal(fullState)
 	if err != nil {
+		return fmt.Errorf("error marshalling full state to JSON: %w", err)
+	}
+
+	backoff := wait.Backoff{
+		Duration: time.Second * 1,
+		Cap:      UpdateStateTimeout,
+	}
+	shouldRetry := func(err error) bool {
+		return err != nil
+	}
+	saveState := func() error {
+		// Check if the secret already exists.
+		existingSecret, getErr := k8sClient.CoreV1().
+			Secrets(metav1.NamespaceSystem).
+			Get(ctx, FullStateSecretName, metav1.GetOptions{})
+
+		// If the secret already exists, update it.
+		if getErr == nil {
+			existingSecret.Data[FullStateSecretName] = stateBytes
+			if updateErr := k8s.UpdateSecret(k8sClient, existingSecret); updateErr != nil {
+				return fmt.Errorf("error updating secret: %w", err)
+			}
+
+			return nil
+		}
+
+		// If the secret does not exist, create it.
+		if apierrors.IsNotFound(getErr) {
+			secret := v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      FullStateSecretName,
+					Namespace: metav1.NamespaceSystem,
+				},
+				Data: map[string][]byte{
+					FullStateSecretName: stateBytes,
+				},
+			}
+			_, createErr := k8sClient.CoreV1().
+				Secrets(metav1.NamespaceSystem).
+				Create(ctx, &secret, metav1.CreateOptions{})
+			if createErr != nil {
+				return fmt.Errorf("error creating secret: %w", err)
+			}
+
+			return nil
+		}
+
+		// At this point we know some unexpected error has occurred.
+		return fmt.Errorf("error getting secret: %w", err)
+	}
+
+	// Retry until success or backoff.Cap has been reached.
+	if err := retry.OnError(backoff, shouldRetry, saveState); err != nil {
+		return fmt.Errorf("error updating secret: %w", err)
+	}
+
+	return nil
+}
+
+// GetFullStateFromK8s fetches the full cluster state from the k8s cluster.
+// In earlier versions of RKE, the full cluster state was stored in a configmap, but it has since been moved
+// to a secret. This function tries fetching it from the secret first and will fall back on the configmap if the secret
+// doesn't exist.
+func GetFullStateFromK8s(k8sClient *kubernetes.Clientset) (state *FullState, err error) {
+	backoff := wait.Backoff{
+		Duration: time.Second * 1,
+		Cap:      GetStateTimeout,
+	}
+	shouldRetry := func(err error) bool {
+		return err != nil
+	}
+	getState := func() error {
+		state, err = getFullStateFromSecret(k8sClient, FullStateSecretName)
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				state, err = getFullStateFromConfigMap(k8sClient, FullStateConfigMapName)
+				if err != nil {
+					return fmt.Errorf("error getting full state from configmap: %w", err)
+				}
+			} else {
+				return fmt.Errorf("error getting full state from secret: %w", err)
+			}
+		}
+
 		return err
 	}
-	timeout := make(chan bool, 1)
-	go func() {
-		for {
-			_, err := k8s.UpdateConfigMap(k8sClient, stateFile, FullStateConfigMapName)
-			if err != nil {
-				time.Sleep(time.Second * 5)
-				continue
-			}
-			log.Infof(ctx, "[state] Successfully Saved full cluster state to Kubernetes ConfigMap: %s", FullStateConfigMapName)
-			timeout <- true
-			break
-		}
-	}()
-	select {
-	case <-timeout:
-		return nil
-	case <-time.After(time.Second * UpdateStateTimeout):
-		return fmt.Errorf("[state] Timeout waiting for kubernetes to be ready")
+
+	// Retry until success or backoff.Cap has been reached.
+	err = retry.OnError(backoff, shouldRetry, getState)
+	return state, err
+}
+
+// getFullStateFromConfigMap fetches the full state from the configmap with the given name in the kube-system namespace.
+func getFullStateFromConfigMap(k8sClient *kubernetes.Clientset, name string) (*FullState, error) {
+	confMap, err := k8s.GetConfigMap(k8sClient, name)
+	if err != nil {
+		return nil, fmt.Errorf("error getting configmap %s: %w", name, err)
 	}
+
+	var fullState *FullState
+	if err = json.Unmarshal([]byte(confMap.Data[name]), &fullState); err != nil {
+		return nil, fmt.Errorf("error unmarshalling full cluster state from configmap %s: %w", name, err)
+	}
+
+	return fullState, nil
+}
+
+// getFullStateFromSecret fetches the full state from the secret with the given name in the kube-system namespace.
+func getFullStateFromSecret(k8sClient *kubernetes.Clientset, name string) (*FullState, error) {
+	secret, err := k8s.GetSecret(k8sClient, name, metav1.NamespaceSystem)
+	if err != nil {
+		return nil, fmt.Errorf("error getting secret %s: %w", name, err)
+	}
+
+	var fullState *FullState
+	if err = json.Unmarshal(secret.Data[name], &fullState); err != nil {
+		return nil, fmt.Errorf("error unmarshalling full cluster state from secret %s: %w", name, err)
+	}
+
+	return fullState, nil
 }
 
 func GetStateFromKubernetes(ctx context.Context, kubeCluster *Cluster) (*Cluster, error) {
@@ -142,7 +249,7 @@ func GetStateFromKubernetes(ctx context.Context, kubeCluster *Cluster) (*Cluster
 			return nil, fmt.Errorf("Failed to unmarshal cluster data")
 		}
 		return &currentCluster, nil
-	case <-time.After(time.Second * GetStateTimeout):
+	case <-time.After(GetStateTimeout):
 		log.Infof(ctx, "Timed out waiting for kubernetes cluster to get state")
 		return nil, fmt.Errorf("Timeout waiting for kubernetes cluster to get state")
 	}

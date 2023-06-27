@@ -223,7 +223,7 @@ func ClusterUp(ctx context.Context, dialersOptions hosts.DialersOptions, flags c
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
 
-	err = cluster.SaveFullStateToKubernetes(ctx, kubeCluster, clusterState)
+	err = cluster.SaveFullStateToK8s(ctx, kubeCluster, clusterState)
 	if err != nil {
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}

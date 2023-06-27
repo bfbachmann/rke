@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/x509"
 	"fmt"
-	"time"
 
 	"github.com/rancher/rke/cluster"
 	"github.com/rancher/rke/hosts"
@@ -207,22 +206,14 @@ func rebuildClusterWithRotatedCertificates(ctx context.Context,
 }
 
 func saveClusterState(ctx context.Context, kubeCluster *cluster.Cluster, clusterState *cluster.FullState) error {
-	var err error
-	if err = kubeCluster.UpdateClusterCurrentState(ctx, clusterState); err != nil {
-		return err
+	if updateErr := kubeCluster.UpdateClusterCurrentState(ctx, clusterState); updateErr != nil {
+		return fmt.Errorf("error updating cluster state: %w", updateErr)
 	}
-	// Attempt to store cluster full state to Kubernetes
-	for i := 1; i <= 3; i++ {
-		err = cluster.SaveFullStateToKubernetes(ctx, kubeCluster, clusterState)
-		if err != nil {
-			time.Sleep(time.Second * time.Duration(2))
-			continue
-		}
-		break
+
+	if saveErr := cluster.SaveFullStateToK8s(ctx, kubeCluster, clusterState); saveErr != nil {
+		logrus.Warnf("Failed to save full state to Kubernetes: %v", saveErr)
 	}
-	if err != nil {
-		logrus.Warnf("Failed to save full cluster state to Kubernetes")
-	}
+
 	return nil
 }
 
