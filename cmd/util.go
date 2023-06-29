@@ -130,7 +130,7 @@ func getStateFile(ctx *cli.Context) error {
 
 	// Try fetch full cluster state from a secret. In older versions of RKE, this was stored in a configmap, but it
 	// is now a secret.
-	rkeFullState, err := cluster.GetFullStateFromK8s(k8sClient)
+	rkeFullState, err := cluster.GetFullStateFromK8s(context.Background(), k8sClient)
 	if err != nil {
 		return fmt.Errorf("error getting full cluster state from secret: %w", err)
 	}

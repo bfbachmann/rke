@@ -161,7 +161,7 @@ func SaveFullStateToK8s(ctx context.Context, kubeCluster *Cluster, fullState *Fu
 // In earlier versions of RKE, the full cluster state was stored in a configmap, but it has since been moved
 // to a secret. This function tries fetching it from the secret first and will fall back on the configmap if the secret
 // doesn't exist.
-func GetFullStateFromK8s(k8sClient *kubernetes.Clientset) (state *FullState, err error) {
+func GetFullStateFromK8s(ctx context.Context, k8sClient kubernetes.Interface) (state *FullState, err error) {
 	backoff := wait.Backoff{
 		Duration: time.Second * 1,
 		Cap:      GetStateTimeout,
@@ -170,10 +170,10 @@ func GetFullStateFromK8s(k8sClient *kubernetes.Clientset) (state *FullState, err
 		return err != nil
 	}
 	getState := func() error {
-		state, err = getFullStateFromSecret(k8sClient, FullStateSecretName)
+		fullStateBytes, err := getFullStateBytesFromSecret(ctx, k8sClient, FullStateSecretName)
 		if err != nil {
 			if apierrors.IsNotFound(err) {
-				state, err = getFullStateFromConfigMap(k8sClient, FullStateConfigMapName)
+				fullStateBytes, err = getFullStateBytesFromConfigMap(ctx, k8sClient, FullStateConfigMapName)
 				if err != nil {
 					return fmt.Errorf("error getting full state from configmap: %w", err)
 				}
@@ -182,7 +182,11 @@ func GetFullStateFromK8s(k8sClient *kubernetes.Clientset) (state *FullState, err
 			}
 		}
 
-		return err
+		if err := json.Unmarshal(fullStateBytes, &state); err != nil {
+			return fmt.Errorf("error unmarshalling full state from JSON: %w", err)
+		}
+
+		return nil
 	}
 
 	// Retry until success or backoff.Cap has been reached.
@@ -190,34 +194,32 @@ func GetFullStateFromK8s(k8sClient *kubernetes.Clientset) (state *FullState, err
 	return state, err
 }
 
-// getFullStateFromConfigMap fetches the full state from the configmap with the given name in the kube-system namespace.
-func getFullStateFromConfigMap(k8sClient *kubernetes.Clientset, name string) (*FullState, error) {
-	confMap, err := k8s.GetConfigMap(k8sClient, name)
+// getFullStateBytesFromConfigMap fetches the full state from the configmap with the given name in the kube-system namespace.
+func getFullStateBytesFromConfigMap(ctx context.Context, k8sClient kubernetes.Interface, name string) ([]byte, error) {
+	confMap, err := k8sClient.CoreV1().ConfigMaps(metav1.NamespaceSystem).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("error getting configmap %s: %w", name, err)
 	}
 
-	var fullState *FullState
-	if err = json.Unmarshal([]byte(confMap.Data[name]), &fullState); err != nil {
-		return nil, fmt.Errorf("error unmarshalling full cluster state from configmap %s: %w", name, err)
+	if _, ok := confMap.Data[name]; !ok {
+		return nil, fmt.Errorf("expected configmap %s to have field %s, but none was found", name, name)
 	}
 
-	return fullState, nil
+	return []byte(confMap.Data[name]), nil
 }
 
-// getFullStateFromSecret fetches the full state from the secret with the given name in the kube-system namespace.
-func getFullStateFromSecret(k8sClient *kubernetes.Clientset, name string) (*FullState, error) {
-	secret, err := k8s.GetSecret(k8sClient, name, metav1.NamespaceSystem)
+// getFullStateBytesFromSecret fetches the full state from the secret with the given name in the kube-system namespace.
+func getFullStateBytesFromSecret(ctx context.Context, k8sClient kubernetes.Interface, name string) ([]byte, error) {
+	secret, err := k8sClient.CoreV1().Secrets(metav1.NamespaceSystem).Get(ctx, name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("error getting secret %s: %w", name, err)
 	}
 
-	var fullState *FullState
-	if err = json.Unmarshal(secret.Data[name], &fullState); err != nil {
-		return nil, fmt.Errorf("error unmarshalling full cluster state from secret %s: %w", name, err)
+	if _, ok := secret.Data[name]; !ok {
+		return nil, fmt.Errorf("expected secret %s to have field %s, but none was found", name, name)
 	}
 
-	return fullState, nil
+	return secret.Data[name], nil
 }
 
 func GetStateFromKubernetes(ctx context.Context, kubeCluster *Cluster) (*Cluster, error) {
