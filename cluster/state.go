@@ -169,7 +169,8 @@ func SaveFullStateToK8s(ctx context.Context, kubeCluster *Cluster, fullState *Fu
 // In earlier versions of RKE, the full cluster state was stored in a configmap, but it has since been moved
 // to a secret. This function tries fetching it from the secret first and will fall back on the configmap if the secret
 // doesn't exist.
-func GetFullStateFromK8s(ctx context.Context, k8sClient kubernetes.Interface) (state *FullState, err error) {
+func GetFullStateFromK8s(ctx context.Context, k8sClient kubernetes.Interface) (*FullState, error) {
+	var fullState FullState
 	backoff := wait.Backoff{
 		Duration: time.Second * 1,
 		Cap:      GetStateTimeout,
@@ -190,7 +191,7 @@ func GetFullStateFromK8s(ctx context.Context, k8sClient kubernetes.Interface) (s
 			}
 		}
 
-		if err := json.Unmarshal(fullStateBytes, state); err != nil {
+		if err := json.Unmarshal(fullStateBytes, &fullState); err != nil {
 			return fmt.Errorf("error unmarshalling full state from JSON: %w", err)
 		}
 
@@ -198,8 +199,8 @@ func GetFullStateFromK8s(ctx context.Context, k8sClient kubernetes.Interface) (s
 	}
 
 	// Retry until success or backoff.Cap has been reached.
-	err = retry.OnError(backoff, shouldRetry, getState)
-	return state, err
+	err := retry.OnError(backoff, shouldRetry, getState)
+	return &fullState, err
 }
 
 // getFullStateBytesFromConfigMap fetches the full state from the configmap with the given name in the kube-system namespace.
