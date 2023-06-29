@@ -114,7 +114,7 @@ func SaveFullStateToK8s(ctx context.Context, kubeCluster *Cluster, fullState *Fu
 			Secrets(metav1.NamespaceSystem).
 			Get(ctx, FullStateSecretName, metav1.GetOptions{})
 
-		// If the secret already exists, update it.
+		// If the secret already exists, update it and return early.
 		if getErr == nil {
 			existingSecret.Data[FullStateSecretName] = stateBytes
 			if updateErr := k8s.UpdateSecret(k8sClient, existingSecret); updateErr != nil {
@@ -124,7 +124,7 @@ func SaveFullStateToK8s(ctx context.Context, kubeCluster *Cluster, fullState *Fu
 			return nil
 		}
 
-		// If the secret does not exist, create it.
+		// If the secret does not exist, create it and remove the old configmap.
 		if apierrors.IsNotFound(getErr) {
 			secret := v1.Secret{
 				ObjectMeta: metav1.ObjectMeta{
@@ -135,18 +135,26 @@ func SaveFullStateToK8s(ctx context.Context, kubeCluster *Cluster, fullState *Fu
 					FullStateSecretName: stateBytes,
 				},
 			}
+
 			_, createErr := k8sClient.CoreV1().
 				Secrets(metav1.NamespaceSystem).
 				Create(ctx, &secret, metav1.CreateOptions{})
 			if createErr != nil {
-				return fmt.Errorf("error creating secret: %w", err)
+				return fmt.Errorf("error creating secret: %w", createErr)
+			}
+
+			deleteErr := k8sClient.CoreV1().
+				ConfigMaps(metav1.NamespaceSystem).
+				Delete(ctx, FullStateConfigMapName, metav1.DeleteOptions{})
+			if deleteErr != nil {
+				return fmt.Errorf("error removing configmap %s: %w", FullStateConfigMapName, deleteErr)
 			}
 
 			return nil
 		}
 
 		// At this point we know some unexpected error has occurred.
-		return fmt.Errorf("error getting secret: %w", err)
+		return fmt.Errorf("error getting secret: %w", getErr)
 	}
 
 	// Retry until success or backoff.Cap has been reached.
