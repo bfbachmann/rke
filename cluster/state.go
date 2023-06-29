@@ -190,7 +190,7 @@ func GetFullStateFromK8s(ctx context.Context, k8sClient kubernetes.Interface) (s
 			}
 		}
 
-		if err := json.Unmarshal(fullStateBytes, &state); err != nil {
+		if err := json.Unmarshal(fullStateBytes, state); err != nil {
 			return fmt.Errorf("error unmarshalling full state from JSON: %w", err)
 		}
 
