@@ -209,11 +209,12 @@ func getFullStateBytesFromConfigMap(ctx context.Context, k8sClient kubernetes.In
 		return nil, fmt.Errorf("error getting configmap %s: %w", name, err)
 	}
 
-	if _, ok := confMap.Data[name]; !ok {
+	data, ok := confMap.Data[name]
+	if !ok {
 		return nil, fmt.Errorf("expected configmap %s to have field %s, but none was found", name, name)
 	}
 
-	return []byte(confMap.Data[name]), nil
+	return []byte(data), nil
 }
 
 // getFullStateBytesFromSecret fetches the full state from the secret with the given name in the kube-system namespace.
@@ -223,11 +224,12 @@ func getFullStateBytesFromSecret(ctx context.Context, k8sClient kubernetes.Inter
 		return nil, fmt.Errorf("error getting secret %s: %w", name, err)
 	}
 
-	if _, ok := secret.Data[name]; !ok {
+	data, ok := secret.Data[name]
+	if !ok {
 		return nil, fmt.Errorf("expected secret %s to have field %s, but none was found", name, name)
 	}
 
-	return secret.Data[name], nil
+	return data, nil
 }
 
 func GetStateFromKubernetes(ctx context.Context, kubeCluster *Cluster) (*Cluster, error) {
