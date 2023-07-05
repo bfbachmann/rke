@@ -7,6 +7,7 @@ import (
 
 	"github.com/rancher/rke/cluster"
 	"github.com/rancher/rke/hosts"
+	"github.com/rancher/rke/k8s"
 	"github.com/rancher/rke/log"
 	"github.com/rancher/rke/pki"
 	"github.com/rancher/rke/pki/cert"
@@ -210,7 +211,12 @@ func saveClusterState(ctx context.Context, kubeCluster *cluster.Cluster, cluster
 		return fmt.Errorf("error updating cluster state: %w", updateErr)
 	}
 
-	if saveErr := cluster.SaveFullStateToK8s(ctx, kubeCluster, clusterState); saveErr != nil {
+	k8sClient, err := k8s.NewClient(kubeCluster.LocalKubeConfigPath, kubeCluster.K8sWrapTransport)
+	if err != nil {
+		return fmt.Errorf("failed to create Kubernetes Client: %w", err)
+	}
+
+	if saveErr := cluster.SaveFullStateToK8s(ctx, k8sClient, clusterState); saveErr != nil {
 		logrus.Warnf("Failed to save full state to Kubernetes: %v", saveErr)
 	}
 

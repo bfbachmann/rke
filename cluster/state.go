@@ -89,76 +89,76 @@ func (c *Cluster) GetStateFileFromConfigMap(ctx context.Context) (string, error)
 
 // SaveFullStateToK8s saves the full cluster state to a k8s secret. This any errors that occur on attempts to update
 // the secret will be retired up until some limit.
-func SaveFullStateToK8s(ctx context.Context, kubeCluster *Cluster, fullState *FullState) error {
-	k8sClient, err := k8s.NewClient(kubeCluster.LocalKubeConfigPath, kubeCluster.K8sWrapTransport)
-	if err != nil {
-		return fmt.Errorf("failed to create Kubernetes Client: %w", err)
-	}
-
-	log.Infof(ctx, "[state] Saving full cluster state to Kubernetes")
+func SaveFullStateToK8s(ctx context.Context, k8sClient kubernetes.Interface, fullState *FullState) error {
 	stateBytes, err := json.Marshal(fullState)
 	if err != nil {
 		return fmt.Errorf("error marshalling full state to JSON: %w", err)
 	}
 
-	backoff := wait.Backoff{
-		Duration: time.Second * 1,
-		Cap:      UpdateStateTimeout,
+	secret := v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      FullStateSecretName,
+			Namespace: metav1.NamespaceSystem,
+		},
+		Data: map[string][]byte{
+			FullStateSecretName: stateBytes,
+		},
 	}
+
+	// Back off for 1s between attempts..
+	backoff := wait.Backoff{
+		Duration: time.Second,
+		Steps:    int(UpdateStateTimeout / time.Second),
+	}
+
+	// Retry if there was an error.
 	shouldRetry := func(err error) bool {
 		return err != nil
 	}
+
+	// Try to create/update the secret in k8s.
 	saveState := func() error {
 		// Check if the secret already exists.
 		existingSecret, getErr := k8sClient.CoreV1().
 			Secrets(metav1.NamespaceSystem).
 			Get(ctx, FullStateSecretName, metav1.GetOptions{})
 
-		// If the secret already exists, update it and return early.
 		if getErr == nil {
+			// The secret already exists. Update it.
 			existingSecret.Data[FullStateSecretName] = stateBytes
-			if updateErr := k8s.UpdateSecret(k8sClient, existingSecret); updateErr != nil {
+			if _, updateErr := k8sClient.CoreV1().Secrets(existingSecret.Namespace).Update(
+				ctx,
+				existingSecret,
+				metav1.UpdateOptions{},
+			); updateErr != nil {
 				return fmt.Errorf("error updating secret: %w", err)
 			}
-
-			return nil
-		}
-
-		// If the secret does not exist, create it and remove the old configmap.
-		if apierrors.IsNotFound(getErr) {
-			secret := v1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      FullStateSecretName,
-					Namespace: metav1.NamespaceSystem,
-				},
-				Data: map[string][]byte{
-					FullStateSecretName: stateBytes,
-				},
-			}
-
+		} else if apierrors.IsNotFound(getErr) {
+			// The secret does not exist, create it.
 			_, createErr := k8sClient.CoreV1().
 				Secrets(metav1.NamespaceSystem).
 				Create(ctx, &secret, metav1.CreateOptions{})
 			if createErr != nil {
 				return fmt.Errorf("error creating secret: %w", createErr)
 			}
-
-			deleteErr := k8sClient.CoreV1().
-				ConfigMaps(metav1.NamespaceSystem).
-				Delete(ctx, FullStateConfigMapName, metav1.DeleteOptions{})
-			if deleteErr != nil {
-				return fmt.Errorf("error removing configmap %s: %w", FullStateConfigMapName, deleteErr)
-			}
-
-			return nil
+		} else {
+			// At this point we know some unexpected error has occurred.
+			return fmt.Errorf("error getting secret: %w", getErr)
 		}
 
-		// At this point we know some unexpected error has occurred.
-		return fmt.Errorf("error getting secret: %w", getErr)
+		// Make sure the old configmap has been deleted.
+		deleteErr := k8sClient.CoreV1().
+			ConfigMaps(metav1.NamespaceSystem).
+			Delete(ctx, FullStateConfigMapName, metav1.DeleteOptions{})
+		if deleteErr != nil && !apierrors.IsNotFound(deleteErr) {
+			return fmt.Errorf("error removing configmap %s: %w", FullStateConfigMapName, deleteErr)
+		}
+
+		return nil
 	}
 
-	// Retry until success or backoff.Cap has been reached.
-	if err := retry.OnError(backoff, shouldRetry, saveState); err != nil {
+	// Retry until success or backoff.Steps has been reached.
+	if err = retry.OnError(backoff, shouldRetry, saveState); err != nil {
 		return fmt.Errorf("error updating secret: %w", err)
 	}
 
@@ -172,8 +172,8 @@ func SaveFullStateToK8s(ctx context.Context, kubeCluster *Cluster, fullState *Fu
 func GetFullStateFromK8s(ctx context.Context, k8sClient kubernetes.Interface) (*FullState, error) {
 	var fullState FullState
 	backoff := wait.Backoff{
-		Duration: time.Second * 1,
-		Cap:      GetStateTimeout,
+		Duration: time.Second,
+		Steps:    int(GetStateTimeout / time.Second),
 	}
 	shouldRetry := func(err error) bool {
 		return err != nil
